@@ -84,37 +84,6 @@ func (s *S3Backup) generateRemoteRequest(rc io.ReadCloser) error {
 	s.log().Debug("got S3 upload urls from the Panel")
 	s.log().WithField("parts", len(urls.Parts)).Info("attempting to upload backup to s3 endpoint...")
 
-	handlePart := func(part string, size int64) (string, error) {
-		r, err := http.NewRequest(http.MethodPut, part, nil)
-		if err != nil {
-			return "", err
-		}
-
-		r.ContentLength = size
-		r.Header.Add("Content-Length", strconv.Itoa(int(size)))
-		r.Header.Add("Content-Type", "application/x-gzip")
-
-		// Limit the reader to the size of the part.
-		r.Body = Reader{Reader: io.LimitReader(rc, size)}
-
-		// This http request can block forever due to it not having a timeout,
-		// but we are uploading up to 5GB of data, so there is not really
-		// a good way to handle a timeout on this.
-		res, err := http.DefaultClient.Do(r)
-		if err != nil {
-			return "", err
-		}
-		defer res.Body.Close()
-
-		// Handle non-200 status codes.
-		if res.StatusCode != http.StatusOK {
-			return "", fmt.Errorf("failed to put S3 object part, %d:%s", res.StatusCode, res.Status)
-		}
-
-		// Get the ETag from the uploaded part, this should be sent with the CompleteMultipartUpload request.
-		return res.Header.Get("ETag"), nil
-	}
-
 	for i, part := range urls.Parts {
 		// Get the size for the current part.
 		var partSize int64
@@ -127,7 +96,7 @@ func (s *S3Backup) generateRemoteRequest(rc io.ReadCloser) error {
 		}
 
 		// Attempt to upload the part.
-		if _, err := handlePart(part, partSize); err != nil {
+		if _, err := handlePart(part, partSize, rc, 1); err != nil {
 			s.log().WithField("part_id", i+1).WithError(err).Warn("failed to upload part")
 			return err
 		}
@@ -138,4 +107,43 @@ func (s *S3Backup) generateRemoteRequest(rc io.ReadCloser) error {
 	s.log().WithField("parts", len(urls.Parts)).Info("backup has been successfully uploaded")
 
 	return nil
+}
+
+func handlePart(part string, size int64, rc io.Reader, try int) (string, error) {
+	r, err := http.NewRequest(http.MethodPut, part, nil)
+	if err != nil {
+		return "", err
+	}
+
+	r.ContentLength = size
+	r.Header.Add("Content-Length", strconv.Itoa(int(size)))
+	r.Header.Add("Content-Type", "application/x-gzip")
+
+	// Limit the reader to the size of the part.
+	r.Body = Reader{Reader: io.LimitReader(rc, size)}
+
+	// This http request can block forever due to it not having a timeout,
+	// but we are uploading up to 5GB of data, so there is not really
+	// a good way to handle a timeout on this.
+	res, err := http.DefaultClient.Do(r)
+	if err != nil {
+		if try < 5 {
+			return handlePart(part, size, rc, try+1)
+		}
+
+		return "", err
+	}
+	defer res.Body.Close()
+
+	// Handle non-200 status codes.
+	if res.StatusCode != http.StatusOK {
+		if res.StatusCode >= http.StatusInternalServerError && try < 5 {
+			return handlePart(part, size, rc, try+1)
+		}
+
+		return "", fmt.Errorf("failed to put S3 object part, %d:%s", res.StatusCode, res.Status)
+	}
+
+	// Get the ETag from the uploaded part, this should be sent with the CompleteMultipartUpload request.
+	return res.Header.Get("ETag"), nil
 }
