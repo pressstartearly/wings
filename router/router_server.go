@@ -3,14 +3,16 @@ package router
 import (
 	"bytes"
 	"context"
-	"github.com/apex/log"
-	"github.com/gin-gonic/gin"
-	"github.com/pkg/errors"
-	"github.com/pterodactyl/wings/router/tokens"
-	"github.com/pterodactyl/wings/server"
 	"net/http"
 	"os"
 	"strconv"
+
+	"emperror.dev/errors"
+	"github.com/apex/log"
+	"github.com/gin-gonic/gin"
+	"github.com/pterodactyl/wings/router/downloader"
+	"github.com/pterodactyl/wings/router/tokens"
+	"github.com/pterodactyl/wings/server"
 )
 
 type serverProcData struct {
@@ -23,7 +25,7 @@ func getServer(c *gin.Context) {
 	s := GetServer(c.Param("server"))
 
 	c.JSON(http.StatusOK, serverProcData{
-		ResourceUsage: *s.Proc(),
+		ResourceUsage: s.Proc(),
 		Suspended:     s.IsSuspended(),
 	})
 }
@@ -41,7 +43,7 @@ func getServerLogs(c *gin.Context) {
 
 	out, err := s.ReadLogfile(l)
 	if err != nil {
-		TrackedServerError(err, s).AbortWithServerError(c)
+		NewServerError(err, s).Abort(c)
 		return
 	}
 
@@ -110,7 +112,7 @@ func postServerCommands(c *gin.Context) {
 	s := GetServer(c.Param("server"))
 
 	if running, err := s.Environment.IsRunning(); err != nil {
-		TrackedServerError(err, s).AbortWithServerError(c)
+		NewServerError(err, s).Abort(c)
 		return
 	} else if !running {
 		c.AbortWithStatusJSON(http.StatusBadGateway, gin.H{
@@ -144,7 +146,7 @@ func patchServer(c *gin.Context) {
 	buf.ReadFrom(c.Request.Body)
 
 	if err := s.UpdateDataStructure(buf.Bytes()); err != nil {
-		TrackedServerError(err, s).AbortWithServerError(c)
+		NewServerError(err, s).Abort(c)
 		return
 	}
 
@@ -188,16 +190,18 @@ func postServerReinstall(c *gin.Context) {
 
 // Deletes a server from the wings daemon and dissociate it's objects.
 func deleteServer(c *gin.Context) {
-	s := GetServer(c.Param("server"))
+	s := ExtractServer(c)
 
 	// Immediately suspend the server to prevent a user from attempting
 	// to start it while this process is running.
 	s.Config().SetSuspended(true)
 
-	// If the server is currently installing, abort it.
-	if s.IsInstalling() {
-		s.AbortInstallation()
-	}
+	// Stop all running background tasks for this server that are using the context on
+	// the server struct. This will cancel any running install processes for the server
+	// as well.
+	s.CtxCancel()
+	s.Events().Destroy()
+	s.Websockets().CancelAll()
 
 	// Delete the server's archive if it exists. We intentionally don't return
 	// here, if the archive fails to delete, the server can still be removed.
@@ -205,16 +209,17 @@ func deleteServer(c *gin.Context) {
 		s.Log().WithField("error", err).Warn("failed to delete server archive during deletion process")
 	}
 
-	// Unsubscribe all of the event listeners.
-	s.Events().Destroy()
-	s.Throttler().StopTimer()
-	s.Websockets().CancelAll()
+	// Remove any pending remote file downloads for the server.
+	for _, dl := range downloader.ByServer(s.Id()) {
+		dl.Cancel()
+	}
 
 	// Destroy the environment; in Docker this will handle a running container and
 	// forcibly terminate it before removing the container, so we do not need to handle
 	// that here.
 	if err := s.Environment.Destroy(); err != nil {
-		TrackedServerError(err, s).AbortWithServerError(c)
+		WithError(c, err)
+		return
 	}
 
 	// Once the environment is terminated, remove the server files from the system. This is
@@ -225,14 +230,11 @@ func deleteServer(c *gin.Context) {
 	// so we don't want to block the HTTP call while waiting on this.
 	go func(p string) {
 		if err := os.RemoveAll(p); err != nil {
-			log.WithFields(log.Fields{
-				"path":  p,
-				"error": err,
-			}).Warn("failed to remove server files during deletion process")
+			log.WithFields(log.Fields{"path": p, "error": err}).Warn("failed to remove server files during deletion process")
 		}
 	}(s.Filesystem().Path())
 
-	var uuid = s.Id()
+	uuid := s.Id()
 	server.GetServers().Remove(func(s2 *server.Server) bool {
 		return s2.Id() == uuid
 	})

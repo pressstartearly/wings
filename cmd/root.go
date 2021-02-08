@@ -3,70 +3,84 @@ package cmd
 import (
 	"crypto/tls"
 	"fmt"
-	"github.com/NYTimes/logrotate"
-	"github.com/apex/log/handlers/multi"
-	"github.com/docker/docker/client"
-	"github.com/gammazero/workerpool"
-	"golang.org/x/crypto/acme"
+	log2 "log"
 	"net/http"
 	"os"
 	"path"
 	"path/filepath"
 	"strings"
 
+	"emperror.dev/errors"
+	"github.com/NYTimes/logrotate"
 	"github.com/apex/log"
+	"github.com/apex/log/handlers/multi"
+	"github.com/docker/docker/client"
+	"github.com/gammazero/workerpool"
 	"github.com/mitchellh/colorstring"
-	"github.com/pterodactyl/wings/loggers/cli"
-	"golang.org/x/crypto/acme/autocert"
-
-	"github.com/pkg/errors"
 	"github.com/pkg/profile"
 	"github.com/pterodactyl/wings/config"
 	"github.com/pterodactyl/wings/environment"
+	"github.com/pterodactyl/wings/loggers/cli"
 	"github.com/pterodactyl/wings/router"
 	"github.com/pterodactyl/wings/server"
 	"github.com/pterodactyl/wings/sftp"
 	"github.com/pterodactyl/wings/system"
 	"github.com/spf13/cobra"
+	"golang.org/x/crypto/acme"
+	"golang.org/x/crypto/acme/autocert"
 )
 
 var (
-	profiler        = ""
-	configPath      = config.DefaultLocation
-	debug           = false
-	useAutomaticTls = false
-	tlsHostname     = ""
-	showVersion     = false
+	configPath = config.DefaultLocation
+	debug      = false
 )
 
-var root = &cobra.Command{
+var rootCommand = &cobra.Command{
 	Use:   "wings",
-	Short: "The wings of the pterodactyl game management panel",
-	Long:  ``,
+	Short: "Runs the API server allowing programatic control of game servers for Pterodactyl Panel.",
 	PreRun: func(cmd *cobra.Command, args []string) {
-		if useAutomaticTls && len(tlsHostname) == 0 {
-			fmt.Println("A TLS hostname must be provided when running wings with automatic TLS, e.g.:\n\n    ./wings --auto-tls --tls-hostname my.example.com")
-			os.Exit(1)
+		if tls, _ := cmd.Flags().GetBool("auto-tls"); tls {
+			if host, _ := cmd.Flags().GetString("tls-hostname"); host == "" {
+				fmt.Println("A TLS hostname must be provided when running wings with automatic TLS, e.g.:\n\n    ./wings --auto-tls --tls-hostname my.example.com")
+				os.Exit(1)
+			}
 		}
 	},
 	Run: rootCmdRun,
 }
 
-func init() {
-	root.PersistentFlags().BoolVar(&showVersion, "version", false, "show the version and exit")
-	root.PersistentFlags().StringVar(&configPath, "config", config.DefaultLocation, "set the location for the configuration file")
-	root.PersistentFlags().BoolVar(&debug, "debug", false, "pass in order to run wings in debug mode")
-	root.PersistentFlags().StringVar(&profiler, "profiler", "", "the profiler to run for this instance")
-	root.PersistentFlags().BoolVar(&useAutomaticTls, "auto-tls", false, "pass in order to have wings generate and manage it's own SSL certificates using Let's Encrypt")
-	root.PersistentFlags().StringVar(&tlsHostname, "tls-hostname", "", "required with --auto-tls, the FQDN for the generated SSL certificate")
+var versionCommand = &cobra.Command{
+	Use:   "version",
+	Short: "Prints the current executable version and exits.",
+	Run: func(cmd *cobra.Command, _ []string) {
+		fmt.Printf("wings v%s\nCopyright © 2018 - 2021 Dane Everitt & Contributors\n", system.Version)
+	},
+}
 
-	root.AddCommand(configureCmd)
-	root.AddCommand(diagnosticsCmd)
+func Execute() {
+	if err := rootCommand.Execute(); err != nil {
+		log2.Fatalf("failed to execute command: %s", err)
+	}
+}
+
+func init() {
+	rootCommand.PersistentFlags().StringVar(&configPath, "config", config.DefaultLocation, "set the location for the configuration file")
+	rootCommand.PersistentFlags().BoolVar(&debug, "debug", false, "pass in order to run wings in debug mode")
+
+	// Flags specifically used when running the API.
+	rootCommand.Flags().String("profiler", "", "the profiler to run for this instance")
+	rootCommand.Flags().Bool("auto-tls", false, "pass in order to have wings generate and manage it's own SSL certificates using Let's Encrypt")
+	rootCommand.Flags().String("tls-hostname", "", "required with --auto-tls, the FQDN for the generated SSL certificate")
+	rootCommand.Flags().Bool("ignore-certificate-errors", false, "ignore certificate verification errors when executing API calls")
+
+	rootCommand.AddCommand(versionCommand)
+	rootCommand.AddCommand(configureCmd)
+	rootCommand.AddCommand(diagnosticsCmd)
 }
 
 // Get the configuration path based on the arguments provided.
 func readConfiguration() (*config.Configuration, error) {
-	var p = configPath
+	p := configPath
 	if !strings.HasPrefix(p, "/") {
 		d, err := os.Getwd()
 		if err != nil {
@@ -85,13 +99,8 @@ func readConfiguration() (*config.Configuration, error) {
 	return config.ReadConfiguration(p)
 }
 
-func rootCmdRun(*cobra.Command, []string) {
-	if showVersion {
-		fmt.Println(system.Version)
-		os.Exit(0)
-	}
-
-	switch profiler {
+func rootCmdRun(cmd *cobra.Command, _ []string) {
+	switch cmd.Flag("profiler").Value.String() {
 	case "cpu":
 		defer profile.Start(profile.CPUProfile).Stop()
 	case "mem":
@@ -117,7 +126,6 @@ func rootCmdRun(*cobra.Command, []string) {
 			if errors.Is(err, os.ErrNotExist) {
 				exitWithConfigurationNotice()
 			}
-
 			panic(err)
 		}
 	}
@@ -139,8 +147,10 @@ func rootCmdRun(*cobra.Command, []string) {
 	log.WithField("path", c.GetPath()).Info("loading configuration from path")
 	if c.Debug {
 		log.Debug("running in debug mode")
-		log.Warn("certificate checking is disabled")
+	}
 
+	if ok, _ := cmd.Flags().GetBool("ignore-certificate-errors"); ok {
+		log.Warn("running with --ignore-certificate-errors: TLS certificate host chains and name will not be verified")
 		http.DefaultTransport.(*http.Transport).TLSClientConfig = &tls.Config{
 			InsecureSkipVerify: true,
 		}
@@ -278,9 +288,15 @@ func rootCmdRun(*cobra.Command, []string) {
 		log.WithField("error", err).Error("failed to create backup directory")
 	}
 
+	autotls, _ := cmd.Flags().GetBool("auto-tls")
+	tlshostname, _ := cmd.Flags().GetString("tls-hostname")
+	if autotls && tlshostname == "" {
+		autotls = false
+	}
+
 	log.WithFields(log.Fields{
 		"use_ssl":      c.Api.Ssl.Enabled,
-		"use_auto_tls": useAutomaticTls && len(tlsHostname) > 0,
+		"use_auto_tls": autotls,
 		"host_address": c.Api.Host,
 		"host_port":    c.Api.Port,
 	}).Info("configuring internal webserver")
@@ -291,7 +307,6 @@ func rootCmdRun(*cobra.Command, []string) {
 	s := &http.Server{
 		Addr:    fmt.Sprintf("%s:%d", c.Api.Host, c.Api.Port),
 		Handler: r,
-
 		TLSConfig: &tls.Config{
 			NextProtos: []string{"h2", "http/1.1"},
 			// @see https://blog.cloudflare.com/exposing-go-on-the-internet
@@ -311,14 +326,14 @@ func rootCmdRun(*cobra.Command, []string) {
 	}
 
 	// Check if the server should run with TLS but using autocert.
-	if useAutomaticTls && len(tlsHostname) > 0 {
+	if autotls {
 		m := autocert.Manager{
 			Prompt:     autocert.AcceptTOS,
 			Cache:      autocert.DirCache(path.Join(c.System.RootDirectory, "/.tls-cache")),
-			HostPolicy: autocert.HostWhitelist(tlsHostname),
+			HostPolicy: autocert.HostWhitelist(tlshostname),
 		}
 
-		log.WithField("hostname", tlsHostname).
+		log.WithField("hostname", tlshostname).
 			Info("webserver is now listening with auto-TLS enabled; certificates will be automatically generated by Let's Encrypt")
 
 		// Hook autocert into the main http server.
@@ -334,7 +349,7 @@ func rootCmdRun(*cobra.Command, []string) {
 
 		// Start the main http server with TLS using autocert.
 		if err := s.ListenAndServeTLS("", ""); err != nil {
-			log.WithFields(log.Fields{"auto_tls": true, "tls_hostname": tlsHostname, "error": err}).
+			log.WithFields(log.Fields{"auto_tls": true, "tls_hostname": tlshostname, "error": err}).
 				Fatal("failed to configure HTTP server using auto-tls")
 		}
 
@@ -354,11 +369,12 @@ func rootCmdRun(*cobra.Command, []string) {
 	if err := s.ListenAndServe(); err != nil {
 		log.WithField("error", err).Fatal("failed to configure HTTP server")
 	}
-}
 
-// Execute calls cobra to handle cli commands
-func Execute() error {
-	return root.Execute()
+	// Cancel the context on all of the running servers at this point, even though the
+	// program is just shutting down.
+	for _, s := range server.GetServers().All() {
+		s.CtxCancel()
+	}
 }
 
 // Configures the global logger for Zap so that we can call it from any location
@@ -371,20 +387,15 @@ func configureLogging(logDir string, debug bool) error {
 	p := filepath.Join(logDir, "/wings.log")
 	w, err := logrotate.NewFile(p)
 	if err != nil {
-		panic(errors.WithMessage(err, "failed to open process log file"))
+		return err
 	}
 
+	log.SetLevel(log.InfoLevel)
 	if debug {
 		log.SetLevel(log.DebugLevel)
-	} else {
-		log.SetLevel(log.InfoLevel)
 	}
 
-	log.SetHandler(multi.New(
-		cli.Default,
-		cli.New(w.File, false),
-	))
-
+	log.SetHandler(multi.New(cli.Default, cli.New(w.File, false)))
 	log.WithField("path", p).Info("writing log files to disk")
 
 	return nil
@@ -398,9 +409,9 @@ __ [blue][bold]Pterodactyl[reset] _____/___/_______ _______ ______
 \_____\    \/\/    /   /       /  __   /   ___/
    \___\          /   /   /   /  /_/  /___   /
         \___/\___/___/___/___/___    /______/
-                            /_______/ [bold]v%s[reset]
+                            /_______/ [bold]%s[reset]
 
-Copyright © 2018 - 2020 Dane Everitt & Contributors
+Copyright © 2018 - 2021 Dane Everitt & Contributors
 
 Website:  https://pterodactyl.io
  Source:  https://github.com/pterodactyl/wings

@@ -35,17 +35,21 @@ func (ult *usageLookupTime) Get() time.Time {
 
 // Returns the maximum amount of disk space that this Filesystem instance is allowed to use.
 func (fs *Filesystem) MaxDisk() int64 {
-	fs.mu.RLock()
-	defer fs.mu.RUnlock()
-
-	return fs.diskLimit
+	return atomic.LoadInt64(&fs.diskLimit)
 }
 
 // Sets the disk space limit for this Filesystem instance.
 func (fs *Filesystem) SetDiskLimit(i int64) {
-	fs.mu.Lock()
-	fs.diskLimit = i
-	fs.mu.Unlock()
+	atomic.SwapInt64(&fs.diskLimit, i)
+}
+
+// The same concept as HasSpaceAvailable however this will return an error if there is
+// no space, rather than a boolean value.
+func (fs *Filesystem) HasSpaceErr(allowStaleValue bool) error {
+	if !fs.HasSpaceAvailable(allowStaleValue) {
+		return &Error{code: ErrCodeDiskSpace}
+	}
+	return nil
 }
 
 // Determines if the directory a file is trying to be added to has enough space available
@@ -78,10 +82,7 @@ func (fs *Filesystem) HasSpaceAvailable(allowStaleValue bool) bool {
 // function for critical logical checks. It should only be used in areas where the actual disk usage
 // does not need to be perfect, e.g. API responses for server resource usage.
 func (fs *Filesystem) CachedUsage() int64 {
-	fs.mu.RLock()
-	defer fs.mu.RUnlock()
-
-	return fs.diskUsed
+	return atomic.LoadInt64(&fs.diskUsed)
 }
 
 // Internal helper function to allow other parts of the codebase to check the total used disk space
@@ -106,7 +107,7 @@ func (fs *Filesystem) DiskUsage(allowStaleValue bool) (int64, error) {
 		// value. This is a blocking operation to the calling process.
 		if !allowStaleValue {
 			return fs.updateCachedDiskUsage()
-		} else if !fs.lookupInProgress.Get() {
+		} else if !fs.lookupInProgress.Load() {
 			// Otherwise, if we allow a stale value and there isn't a valid item in the cache and we aren't
 			// currently performing a lookup, just do the disk usage calculation in the background.
 			go func(fs *Filesystem) {
@@ -132,8 +133,8 @@ func (fs *Filesystem) updateCachedDiskUsage() (int64, error) {
 	// Signal that we're currently updating the disk size so that other calls to the disk checking
 	// functions can determine if they should queue up additional calls to this function. Ensure that
 	// we always set this back to "false" when this process is done executing.
-	fs.lookupInProgress.Set(true)
-	defer fs.lookupInProgress.Set(false)
+	fs.lookupInProgress.Store(true)
+	defer fs.lookupInProgress.Store(false)
 
 	// If there is no size its either because there is no data (in which case running this function
 	// will have effectively no impact), or there is nothing in the cache, in which case we need to
@@ -171,7 +172,7 @@ func (fs *Filesystem) DirectorySize(dir string) (int64, error) {
 			// it. Otherwise, allow it to continue.
 			if e.IsSymlink() {
 				if _, err := fs.SafePath(p); err != nil {
-					if IsBadPathResolutionError(err) {
+					if IsErrorCode(err, ErrCodePathResolution) {
 						return godirwalk.SkipThis
 					}
 
@@ -194,7 +195,7 @@ func (fs *Filesystem) DirectorySize(dir string) (int64, error) {
 // Helper function to determine if a server has space available for a file of a given size.
 // If space is available, no error will be returned, otherwise an ErrNotEnoughSpace error
 // will be raised.
-func (fs *Filesystem) hasSpaceFor(size int64) error {
+func (fs *Filesystem) HasSpaceFor(size int64) error {
 	if fs.MaxDisk() == 0 {
 		return nil
 	}
@@ -205,7 +206,7 @@ func (fs *Filesystem) hasSpaceFor(size int64) error {
 	}
 
 	if (s + size) > fs.MaxDisk() {
-		return ErrNotEnoughDiskSpace
+		return &Error{code: ErrCodeDiskSpace}
 	}
 
 	return nil

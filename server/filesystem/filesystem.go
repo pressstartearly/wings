@@ -2,9 +2,9 @@ package filesystem
 
 import (
 	"bufio"
+	"emperror.dev/errors"
 	"github.com/gabriel-vasile/mimetype"
 	"github.com/karrick/godirwalk"
-	"github.com/pkg/errors"
 	"github.com/pterodactyl/wings/config"
 	"github.com/pterodactyl/wings/system"
 	"io"
@@ -22,7 +22,7 @@ import (
 type Filesystem struct {
 	mu                sync.RWMutex
 	lastLookupTime    *usageLookupTime
-	lookupInProgress  system.AtomicBool
+	lookupInProgress  *system.AtomicBool
 	diskUsed          int64
 	diskCheckInterval time.Duration
 
@@ -42,6 +42,7 @@ func New(root string, size int64) *Filesystem {
 		diskLimit:         size,
 		diskCheckInterval: time.Duration(config.Get().System.DiskCheckInterval),
 		lastLookupTime:    &usageLookupTime{},
+		lookupInProgress:  system.NewAtomicBool(false),
 	}
 }
 
@@ -50,29 +51,36 @@ func (fs *Filesystem) Path() string {
 	return fs.root
 }
 
+// Returns a reader for a file instance.
+func (fs *Filesystem) File(p string) (*os.File, os.FileInfo, error) {
+	cleaned, err := fs.SafePath(p)
+	if err != nil {
+		return nil, nil, err
+	}
+	st, err := os.Stat(cleaned)
+	if err != nil {
+		return nil, nil, err
+	}
+	if st.IsDir() {
+		return nil, nil, &Error{code: ErrCodeIsDirectory}
+	}
+	f, err := os.Open(cleaned)
+	if err != nil {
+		return nil, nil, err
+	}
+	return f, st, nil
+}
+
 // Reads a file on the system and returns it as a byte representation in a file
 // reader. This is not the most memory efficient usage since it will be reading the
 // entirety of the file into memory.
 func (fs *Filesystem) Readfile(p string, w io.Writer) error {
-	cleaned, err := fs.SafePath(p)
+	file, _, err := fs.File(p)
 	if err != nil {
 		return err
 	}
-
-	if st, err := os.Stat(cleaned); err != nil {
-		return err
-	} else if st.IsDir() {
-		return ErrIsDirectory
-	}
-
-	f, err := os.Open(cleaned)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-
-	_, err = bufio.NewReader(f).WriteTo(w)
-
+	defer file.Close()
+	_, err = bufio.NewReader(file).WriteTo(w)
 	return err
 }
 
@@ -86,32 +94,34 @@ func (fs *Filesystem) Writefile(p string, r io.Reader) error {
 	var currentSize int64
 	// If the file does not exist on the system already go ahead and create the pathway
 	// to it and an empty file. We'll then write to it later on after this completes.
-	if stat, err := os.Stat(cleaned); err != nil {
-		if !os.IsNotExist(err) {
-			return err
-		}
-
-		if err := os.MkdirAll(filepath.Dir(cleaned), 0755); err != nil {
-			return err
-		}
-
-		if err := fs.Chown(filepath.Dir(cleaned)); err != nil {
-			return err
-		}
-	} else {
+	stat, err := os.Stat(cleaned)
+	if err != nil && !os.IsNotExist(err) {
+		return err
+	} else if err == nil {
 		if stat.IsDir() {
-			return ErrIsDirectory
+			return &Error{code: ErrCodeIsDirectory}
 		}
-
 		currentSize = stat.Size()
 	}
 
 	br := bufio.NewReader(r)
-	// Check that the new size we're writing to the disk can fit. If there is currently a file
-	// we'll subtract that current file size from the size of the buffer to determine the amount
-	// of new data we're writing (or amount we're removing if smaller).
-	if err := fs.hasSpaceFor(int64(br.Size()) - currentSize); err != nil {
+	// Check that the new size we're writing to the disk can fit. If there is currently
+	// a file we'll subtract that current file size from the size of the buffer to determine
+	// the amount of new data we're writing (or amount we're removing if smaller).
+	if err := fs.HasSpaceFor(int64(br.Size()) - currentSize); err != nil {
 		return err
+	}
+
+	// If we were unable to stat the location because it did not exist, go ahead and create
+	// it now. We do this after checking the disk space so that we do not just create empty
+	// directories at random.
+	if err != nil {
+		if err := os.MkdirAll(filepath.Dir(cleaned), 0755); err != nil {
+			return err
+		}
+		if err := fs.Chown(filepath.Dir(cleaned)); err != nil {
+			return err
+		}
 	}
 
 	o := &fileOpener{}
@@ -254,7 +264,7 @@ func (fs *Filesystem) Chmod(path string, mode os.FileMode) error {
 // looping endlessly.
 func (fs *Filesystem) findCopySuffix(dir string, name string, extension string) (string, error) {
 	var i int
-	var suffix = " copy"
+	suffix := " copy"
 
 	for i = 0; i < 51; i++ {
 		if i > 0 {
@@ -298,7 +308,7 @@ func (fs *Filesystem) Copy(p string) error {
 	}
 
 	// Check that copying this file wouldn't put the server over its limit.
-	if err := fs.hasSpaceFor(s.Size()); err != nil {
+	if err := fs.HasSpaceFor(s.Size()); err != nil {
 		return err
 	}
 

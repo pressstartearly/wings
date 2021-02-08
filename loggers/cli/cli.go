@@ -1,15 +1,15 @@
 package cli
 
 import (
+	"emperror.dev/errors"
 	"fmt"
 	"github.com/apex/log"
 	"github.com/apex/log/handlers/cli"
 	color2 "github.com/fatih/color"
 	"github.com/mattn/go-colorable"
-	"github.com/pkg/errors"
 	"io"
-	"math"
 	"os"
+	"strings"
 	"sync"
 	"time"
 )
@@ -42,10 +42,6 @@ func New(w io.Writer, useColors bool) *Handler {
 	return &Handler{Writer: colorable.NewNonColorable(w), Padding: 2}
 }
 
-type tracer interface {
-	StackTrace() errors.StackTrace
-}
-
 // HandleLog implements log.Handler.
 func (h *Handler) HandleLog(e *log.Entry) error {
 	color := cli.Colors[e.Level]
@@ -70,15 +66,63 @@ func (h *Handler) HandleLog(e *log.Entry) error {
 		if name != "error" {
 			continue
 		}
+
 		if err, ok := e.Fields.Get("error").(error); ok {
-			if e, ok := errors.Cause(err).(tracer); ok {
-				st := e.StackTrace()
-				l := math.Min(float64(len(st)), 10)
-				fmt.Fprintf(h.Writer, "\n%s%+v\n\n", boldred.Sprintf("Stacktrace:"), st[0:int(l)])
-			} else {
-				fmt.Fprintf(h.Writer, "\n%s\n%+v\n\n", boldred.Sprintf("Stacktrace:"), err)
+			// Attach the stacktrace if it is missing at this point, but don't point
+			// it specifically to this line since that is irrelevant.
+			err = errors.WithStackDepthIf(err, 4)
+			formatted := fmt.Sprintf("\n%s\n%+v\n\n", boldred.Sprintf("Stacktrace:"), err)
+
+			if !strings.Contains(formatted, "runtime.goexit") {
+				_, _ = fmt.Fprint(h.Writer, formatted)
+				break
 			}
+
+			// Inserts a new-line between sections of a stack.
+			// When wrapping errors, you get multiple separate stacks that start with their message,
+			// this allows us to separate them with a new-line and view them more easily.
+			//
+			// For example:
+			//
+			// Stacktrace:
+			// readlink test: no such file or directory
+			// failed to read symlink target for 'test'
+			// github.com/pterodactyl/wings/server/filesystem.(*Archive).addToArchive
+			//         github.com/pterodactyl/wings/server/filesystem/archive.go:166
+			// ... (Truncated the stack for easier reading)
+			// runtime.goexit
+			//         runtime/asm_amd64.s:1374
+			// **NEW LINE INSERTED HERE**
+			// backup: error while generating server backup
+			// github.com/pterodactyl/wings/server.(*Server).Backup
+			//         github.com/pterodactyl/wings/server/backup.go:84
+			// ... (Truncated the stack for easier reading)
+			// runtime.goexit
+			//         runtime/asm_amd64.s:1374
+			//
+			var b strings.Builder
+			var endOfStack bool
+			for _, s := range strings.Split(formatted, "\n") {
+				b.WriteString(s + "\n")
+
+				if s == "runtime.goexit" {
+					endOfStack = true
+					continue
+				}
+
+				if !endOfStack {
+					continue
+				}
+
+				b.WriteString("\n")
+				endOfStack = false
+			}
+
+			_, _ = fmt.Fprint(h.Writer, b.String())
 		}
+
+		// Only one key with the name "error" can be in the map.
+		break
 	}
 
 	return nil

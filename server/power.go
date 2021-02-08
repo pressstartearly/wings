@@ -2,13 +2,13 @@ package server
 
 import (
 	"context"
-	"github.com/pkg/errors"
-	"github.com/pterodactyl/wings/config"
-	"github.com/pterodactyl/wings/environment"
-	"github.com/pterodactyl/wings/server/filesystem"
-	"golang.org/x/sync/semaphore"
 	"os"
 	"time"
+
+	"emperror.dev/errors"
+	"github.com/pterodactyl/wings/config"
+	"github.com/pterodactyl/wings/environment"
+	"golang.org/x/sync/semaphore"
 )
 
 type PowerAction string
@@ -62,6 +62,14 @@ func (s *Server) ExecutingPowerAction() bool {
 // function rather than making direct calls to the start/stop/restart functions on the
 // environment struct.
 func (s *Server) HandlePowerAction(action PowerAction, waitSeconds ...int) error {
+	if s.IsInstalling() {
+		return ErrServerIsInstalling
+	}
+
+	if s.IsTransferring() {
+		return ErrServerIsTransferring
+	}
+
 	if s.powerLock == nil {
 		s.powerLock = semaphore.NewWeighted(1)
 	}
@@ -168,8 +176,8 @@ func (s *Server) onBeforeStart() error {
 		s.Filesystem().HasSpaceAvailable(true)
 	} else {
 		s.PublishConsoleOutputFromDaemon("Checking server disk space usage, this could take a few seconds...")
-		if !s.Filesystem().HasSpaceAvailable(false) {
-			return filesystem.ErrNotEnoughDiskSpace
+		if err := s.Filesystem().HasSpaceErr(false); err != nil {
+			return err
 		}
 	}
 

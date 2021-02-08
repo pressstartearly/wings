@@ -1,13 +1,14 @@
 package router
 
 import (
-	"errors"
 	"fmt"
+	"net/http"
+	"os"
+
+	"emperror.dev/errors"
 	"github.com/gin-gonic/gin"
 	"github.com/pterodactyl/wings/server"
 	"github.com/pterodactyl/wings/server/backup"
-	"net/http"
-	"os"
 )
 
 // Backs up a server.
@@ -34,13 +35,18 @@ func postServerBackup(c *gin.Context) {
 	}
 
 	if err != nil {
-		TrackedServerError(err, s).AbortWithServerError(c)
+		NewServerError(err, s).Abort(c)
 		return
 	}
 
+	// Attach the server ID to the backup log output for easier parsing.
+	adapter.WithLogContext(map[string]interface{}{
+		"server": s.Id(),
+	})
+
 	go func(b backup.BackupInterface, serv *server.Server) {
 		if err := serv.Backup(b); err != nil {
-			serv.Log().WithField("error", err).Error("failed to generate backup for server")
+			serv.Log().WithField("error", errors.WithStackIf(err)).Error("failed to generate backup for server")
 		}
 	}(adapter, s)
 
@@ -63,7 +69,7 @@ func deleteServerBackup(c *gin.Context) {
 			return
 		}
 
-		TrackedServerError(err, s).AbortWithServerError(c)
+		NewServerError(err, s).Abort(c)
 		return
 	}
 
@@ -72,7 +78,7 @@ func deleteServerBackup(c *gin.Context) {
 		// the backup previously and it is now missing when we go to delete, just treat it as having
 		// been successful, rather than returning a 404.
 		if !errors.Is(err, os.ErrNotExist) {
-			TrackedServerError(err, s).AbortWithServerError(c)
+			NewServerError(err, s).Abort(c)
 			return
 		}
 	}

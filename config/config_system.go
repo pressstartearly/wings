@@ -3,8 +3,6 @@ package config
 import (
 	"context"
 	"fmt"
-	"github.com/apex/log"
-	"github.com/pkg/errors"
 	"html/template"
 	"io/ioutil"
 	"os"
@@ -13,6 +11,9 @@ import (
 	"path/filepath"
 	"regexp"
 	"time"
+
+	"emperror.dev/errors"
+	"github.com/apex/log"
 )
 
 // Defines basic system configuration settings.
@@ -75,6 +76,10 @@ type SystemConfiguration struct {
 	Sftp SftpConfiguration `yaml:"sftp"`
 
 	CrashDetection CrashDetection `yaml:"crash_detection"`
+
+	Backups Backups `yaml:"backups"`
+
+	Transfers Transfers `yaml:"transfers"`
 }
 
 type CrashDetection struct {
@@ -87,6 +92,28 @@ type CrashDetection struct {
 	// to be automatically restarted, this value is used to prevent servers from
 	// becoming stuck in a boot-loop after multiple consecutive crashes.
 	Timeout int `default:"60" json:"timeout"`
+}
+
+type Backups struct {
+	// WriteLimit imposes a Disk I/O write limit on backups to the disk, this affects all
+	// backup drivers as the archiver must first write the file to the disk in order to
+	// upload it to any external storage provider.
+	//
+	// If the value is less than 1, the write speed is unlimited,
+	// if the value is greater than 0, the write speed is the value in MiB/s.
+	//
+	// Defaults to 0 (unlimited)
+	WriteLimit int `default:"0" yaml:"write_limit"`
+}
+
+type Transfers struct {
+	// DownloadLimit imposes a Network I/O read limit when downloading a transfer archive.
+	//
+	// If the value is less than 1, the write speed is unlimited,
+	// if the value is greater than 0, the write speed is the value in MiB/s.
+	//
+	// Defaults to 0 (unlimited)
+	DownloadLimit int `default:"0" yaml:"download_limit"`
 }
 
 // Ensures that all of the system directories exist on the system. These directories are

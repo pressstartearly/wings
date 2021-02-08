@@ -2,8 +2,8 @@ package docker
 
 import (
 	"bufio"
-	"bytes"
 	"context"
+	"emperror.dev/errors"
 	"encoding/json"
 	"fmt"
 	"github.com/apex/log"
@@ -12,9 +12,9 @@ import (
 	"github.com/docker/docker/api/types/mount"
 	"github.com/docker/docker/client"
 	"github.com/docker/docker/daemon/logger/jsonfilelog"
-	"github.com/pkg/errors"
 	"github.com/pterodactyl/wings/config"
 	"github.com/pterodactyl/wings/environment"
+	"github.com/pterodactyl/wings/system"
 	"io"
 	"strconv"
 	"strings"
@@ -26,10 +26,26 @@ type imagePullStatus struct {
 	Progress string `json:"progress"`
 }
 
+// A custom console writer that allows us to keep a function blocked until the
+// given stream is properly closed. This does nothing special, only exists to
+// make a noop io.Writer.
+type noopWriter struct{}
+
+var _ io.Writer = noopWriter{}
+
+// Implement the required Write function to satisfy the io.Writer interface.
+func (nw noopWriter) Write(b []byte) (int, error) {
+	return len(b), nil
+}
+
 // Attaches to the docker container itself and ensures that we can pipe data in and out
 // of the process stream. This should not be used for reading console data as you *will*
 // miss important output at the beginning because of the time delay with attaching to the
 // output.
+//
+// Calling this function will poll resources for the container in the background until the
+// provided context is canceled by the caller. Failure to cancel said context will cause
+// background memory leaks as the goroutine will not exit.
 func (e *Environment) Attach() error {
 	if e.IsAttached() {
 		return nil
@@ -53,10 +69,8 @@ func (e *Environment) Attach() error {
 		e.SetStream(&st)
 	}
 
-	c := new(Console)
-	go func(console *Console) {
+	go func() {
 		ctx, cancel := context.WithCancel(context.Background())
-
 		defer cancel()
 		defer e.stream.Close()
 		defer func() {
@@ -64,27 +78,32 @@ func (e *Environment) Attach() error {
 			e.SetStream(nil)
 		}()
 
-		// Poll resources in a separate thread since this will block the copy call below
-		// from being reached until it is completed if not run in a separate process. However,
-		// we still want it to be stopped when the copy operation below is finished running which
-		// indicates that the container is no longer running.
-		go func(ctx context.Context) {
+		go func() {
 			if err := e.pollResources(ctx); err != nil {
-				l := log.WithField("environment_id", e.Id)
 				if !errors.Is(err, context.Canceled) {
-					l.WithField("error", err).Error("error during environment resource polling")
+					e.log().WithField("error", err).Error("error during environment resource polling")
 				} else {
-					l.Warn("stopping server resource polling: context canceled")
+					e.log().Warn("stopping server resource polling: context canceled")
 				}
 			}
-		}(ctx)
+		}()
 
-		// Stream the reader output to the console which will then fire off events and handle console
-		// throttling and sending the output to the user.
-		if _, err := io.Copy(console, e.stream.Reader); err != nil {
-			log.WithField("environment_id", e.Id).WithField("error", err).Error("error while copying environment output to console")
+		// Block the completion of this routine until the container is no longer running. This allows
+		// the pollResources function to run until it needs to be stopped. Because the container
+		// can be polled for resource usage, even when stopped, we need to have this logic present
+		// in order to cancel the context and therefore stop the routine that is spawned.
+		//
+		// For now, DO NOT use client#ContainerWait from the Docker package. There is a nasty
+		// bug causing containers to hang on deletion and cause servers to lock up on the system.
+		//
+		// This weird code isn't intuitive, but it keeps the function from ending until the container
+		// is stopped and therefore the stream reader ends up closed.
+		// @see https://github.com/moby/moby/issues/41827
+		c := new(noopWriter)
+		if _, err := io.Copy(c, e.stream.Reader); err != nil {
+			e.log().WithField("error", err).Error("could not copy from environment stream to noop writer")
 		}
-	}(c)
+	}()
 
 	return nil
 }
@@ -212,6 +231,7 @@ func (e *Environment) Create() error {
 			Config: map[string]string{
 				"max-size": "5m",
 				"max-file": "1",
+				"compress": "false",
 			},
 		},
 
@@ -224,7 +244,7 @@ func (e *Environment) Create() error {
 		NetworkMode: container.NetworkMode(config.Get().Docker.Network.Mode),
 	}
 
-	if _, err := e.client.ContainerCreate(context.Background(), conf, hostConf, nil, e.Id); err != nil {
+	if _, err := e.client.ContainerCreate(context.Background(), conf, hostConf, nil, nil, e.Id); err != nil {
 		return err
 	}
 
@@ -258,6 +278,8 @@ func (e *Environment) Destroy() error {
 		Force:         true,
 	})
 
+	e.SetState(environment.ProcessOfflineState)
+
 	// Don't trigger a destroy failure if we try to delete a container that does not
 	// exist on the system. We're just a step ahead of ourselves in that case.
 	//
@@ -265,8 +287,6 @@ func (e *Environment) Destroy() error {
 	if err != nil && client.IsErrNotFound(err) {
 		return nil
 	}
-
-	e.SetState(environment.ProcessOfflineState)
 
 	return err
 }
@@ -279,7 +299,6 @@ func (e *Environment) followOutput() error {
 		if err != nil {
 			return err
 		}
-
 		return errors.New(fmt.Sprintf("no such container: %s", e.Id))
 	}
 
@@ -291,69 +310,40 @@ func (e *Environment) followOutput() error {
 	}
 
 	reader, err := e.client.ContainerLogs(context.Background(), e.Id, opts)
+	if err != nil {
+		return err
+	}
 
-	go func(reader io.ReadCloser) {
-		defer reader.Close()
+	go e.scanOutput(reader)
 
-		r := bufio.NewReader(reader)
+	return nil
+}
 
-		// Micro-optimization to create these replacements one time when this routine
-		// fires up, rather than on every line that is executed.
-		cr := []byte(" \r")
-		crr := []byte("\r\n")
+func (e *Environment) scanOutput(reader io.ReadCloser) {
+	defer reader.Close()
 
-		// Avoid constantly re-allocating memory when we're flooding lines through this
-		// function by using the same buffer for the duration of the call and just truncating
-		// the value back to 0 every loop.
-		var str strings.Builder
-	ParentLoop:
-		for {
-			str.Reset()
-			var line []byte
-			var isPrefix bool
+	events := e.Events()
 
-			for {
-				// Read the line and write it to the buffer.
-				line, isPrefix, err = r.ReadLine()
+	err := system.ScanReader(reader, func(line string) {
+		events.Publish(environment.ConsoleOutputEvent, line)
+	})
 
-				// Certain games like Minecraft output absolutely random carriage returns in the output seemingly
-				// in line with that it thinks is the terminal size. Those returns break a lot of output handling,
-				// so we'll just replace them with proper new-lines and then split it later and send each line as
-				// its own event in the response.
-				str.Write(bytes.Replace(line, cr, crr, -1))
+	if err != nil && err != io.EOF {
+		log.WithField("error", err).WithField("container_id", e.Id).Warn("error processing scanner line in console output")
+		return
+	}
 
-				// Finish this loop and begin outputting the line if there is no prefix (the line fit into
-				// the default buffer), or if we hit the end of the line.
-				if !isPrefix || err == io.EOF {
-					break
-				}
+	// Return here if the server is offline or currently stopping.
+	if e.State() == environment.ProcessStoppingState || e.State() == environment.ProcessOfflineState {
+		return
+	}
 
-				// If we encountered an error with something in ReadLine that was not an EOF just abort
-				// the entire process here.
-				if err != nil {
-					break ParentLoop
-				}
-			}
+	// Close the current reader before starting a new one, the defer will still run
+	// but it will do nothing if we already closed the stream.
+	_ = reader.Close()
 
-			// Publish the line for this loop. Break on new-line characters so every line is sent as a single
-			// output event, otherwise you get funky handling in the browser console.
-			for _, line := range strings.Split(str.String(), "\r\n") {
-				e.Events().Publish(environment.ConsoleOutputEvent, line)
-			}
-
-			// If the error we got previously that lead to the line being output is an io.EOF we want to
-			// exit the entire looping process.
-			if err == io.EOF {
-				break
-			}
-		}
-
-		if err != nil && err != io.EOF {
-			log.WithField("error", err).WithField("container_id", e.Id).Warn("error processing scanner line in console output")
-		}
-	}(reader)
-
-	return err
+	// Start following the output of the server again.
+	go e.followOutput()
 }
 
 // Pulls the image from Docker. If there is an error while pulling the image from the source
@@ -439,9 +429,11 @@ func (e *Environment) ensureImageExists(image string) error {
 	// I'm not sure what the best approach here is, but this will block execution until the image
 	// is done being pulled, which is what we need.
 	scanner := bufio.NewScanner(out)
+
 	for scanner.Scan() {
 		s := imagePullStatus{}
 		fmt.Println(scanner.Text())
+
 		if err := json.Unmarshal(scanner.Bytes(), &s); err == nil {
 			e.Events().Publish(environment.DockerImagePullStatus, s.Status+" "+s.Progress)
 		}

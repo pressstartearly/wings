@@ -3,19 +3,20 @@ package router
 import (
 	"bufio"
 	"errors"
-	"github.com/gin-gonic/gin"
-	"github.com/pterodactyl/wings/router/tokens"
-	"github.com/pterodactyl/wings/server/backup"
 	"net/http"
 	"os"
 	"strconv"
+
+	"github.com/gin-gonic/gin"
+	"github.com/pterodactyl/wings/router/tokens"
+	"github.com/pterodactyl/wings/server/backup"
 )
 
 // Handle a download request for a server backup.
 func getDownloadBackup(c *gin.Context) {
 	token := tokens.BackupPayload{}
 	if err := tokens.ParseToken([]byte(c.Query("token")), &token); err != nil {
-		TrackedError(err).AbortWithServerError(c)
+		NewTrackedError(err).Abort(c)
 		return
 	}
 
@@ -36,13 +37,13 @@ func getDownloadBackup(c *gin.Context) {
 			return
 		}
 
-		TrackedServerError(err, s).AbortWithServerError(c)
+		NewServerError(err, s).Abort(c)
 		return
 	}
 
 	f, err := os.Open(b.Path())
 	if err != nil {
-		TrackedServerError(err, s).AbortWithServerError(c)
+		NewServerError(err, s).Abort(c)
 		return
 	}
 	defer f.Close()
@@ -58,7 +59,7 @@ func getDownloadBackup(c *gin.Context) {
 func getDownloadFile(c *gin.Context) {
 	token := tokens.FilePayload{}
 	if err := tokens.ParseToken([]byte(c.Query("token")), &token); err != nil {
-		TrackedError(err).AbortWithServerError(c)
+		NewTrackedError(err).Abort(c)
 		return
 	}
 
@@ -75,7 +76,7 @@ func getDownloadFile(c *gin.Context) {
 	// If there is an error or we're somehow trying to download a directory, just
 	// respond with the appropriate error.
 	if err != nil {
-		TrackedServerError(err, s).AbortWithServerError(c)
+		NewServerError(err, s).Abort(c)
 		return
 	} else if st.IsDir() {
 		c.AbortWithStatusJSON(http.StatusNotFound, gin.H{
@@ -86,7 +87,7 @@ func getDownloadFile(c *gin.Context) {
 
 	f, err := os.Open(p)
 	if err != nil {
-		TrackedServerError(err, s).AbortWithServerError(c)
+		NewServerError(err, s).Abort(c)
 		return
 	}
 

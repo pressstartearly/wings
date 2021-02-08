@@ -1,14 +1,15 @@
 package sftp
 
 import (
-	"github.com/apex/log"
-	"github.com/patrickmn/go-cache"
-	"github.com/pkg/sftp"
 	"io"
 	"io/ioutil"
 	"os"
 	"path/filepath"
 	"sync"
+
+	"github.com/apex/log"
+	"github.com/patrickmn/go-cache"
+	"github.com/pkg/sftp"
 )
 
 type FileSystem struct {
@@ -82,7 +83,7 @@ func (fs FileSystem) Filewrite(request *sftp.Request) (io.WriterAt, error) {
 		return nil, sftp.ErrSshFxNoSuchFile
 	}
 
-	var l = fs.logger.WithField("source", p)
+	l := fs.logger.WithField("source", p)
 
 	// If the user doesn't have enough space left on the server it should respond with an
 	// error since we won't be letting them write this file to the disk.
@@ -183,7 +184,7 @@ func (fs FileSystem) Filecmd(request *sftp.Request) error {
 		return sftp.ErrSshFxNoSuchFile
 	}
 
-	var l = fs.logger.WithField("source", p)
+	l := fs.logger.WithField("source", p)
 
 	var target string
 	// If a target is provided in this request validate that it is going to the correct
@@ -202,7 +203,7 @@ func (fs FileSystem) Filecmd(request *sftp.Request) error {
 			return sftp.ErrSshFxPermissionDenied
 		}
 
-		var mode os.FileMode = 0644
+		mode := os.FileMode(0644)
 		// If the client passed a valid file permission use that, otherwise use the
 		// default of 0644 set above.
 		if request.Attributes().FileMode().Perm() != 0000 {

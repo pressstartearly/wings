@@ -2,6 +2,7 @@ package docker
 
 import (
 	"context"
+	"github.com/apex/log"
 	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/client"
 	"github.com/pterodactyl/wings/api"
@@ -23,7 +24,7 @@ var _ environment.ProcessEnvironment = (*Environment)(nil)
 
 type Environment struct {
 	mu      sync.RWMutex
-	eventMu sync.Mutex
+	eventMu sync.Once
 
 	// The public identifier for this environment. In this case it is the Docker container
 	// name that will be used for all instances created under it.
@@ -70,6 +71,10 @@ func New(id string, m *Metadata, c *environment.Configuration) (*Environment, er
 	return e, nil
 }
 
+func (e *Environment) log() *log.Entry {
+	return log.WithField("environment", e.Type()).WithField("container_id", e.Id)
+}
+
 func (e *Environment) Type() string {
 	return "docker"
 }
@@ -77,8 +82,9 @@ func (e *Environment) Type() string {
 // Set if this process is currently attached to the process.
 func (e *Environment) SetStream(s *types.HijackedResponse) {
 	e.mu.Lock()
+	defer e.mu.Unlock()
+
 	e.stream = s
-	e.mu.Unlock()
 }
 
 // Determine if the this process is currently attached to the container.
@@ -90,12 +96,9 @@ func (e *Environment) IsAttached() bool {
 }
 
 func (e *Environment) Events() *events.EventBus {
-	e.eventMu.Lock()
-	defer e.eventMu.Unlock()
-
-	if e.emitter == nil {
+	e.eventMu.Do(func() {
 		e.emitter = events.New()
-	}
+	})
 
 	return e.emitter
 }
@@ -173,12 +176,14 @@ func (e *Environment) Config() *environment.Configuration {
 // Sets the stop configuration for the environment.
 func (e *Environment) SetStopConfiguration(c api.ProcessStopConfiguration) {
 	e.mu.Lock()
+	defer e.mu.Unlock()
+
 	e.meta.Stop = c
-	e.mu.Unlock()
 }
 
 func (e *Environment) SetImage(i string) {
 	e.mu.Lock()
+	defer e.mu.Unlock()
+
 	e.meta.Image = i
-	e.mu.Unlock()
 }

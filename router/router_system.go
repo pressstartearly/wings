@@ -2,21 +2,22 @@ package router
 
 import (
 	"bytes"
+	"net/http"
+	"strings"
+
 	"github.com/apex/log"
 	"github.com/gin-gonic/gin"
 	"github.com/pterodactyl/wings/config"
 	"github.com/pterodactyl/wings/installer"
 	"github.com/pterodactyl/wings/server"
 	"github.com/pterodactyl/wings/system"
-	"net/http"
-	"strings"
 )
 
 // Returns information about the system that wings is running on.
 func getSystemInformation(c *gin.Context) {
 	i, err := system.GetSystemInformation()
 	if err != nil {
-		TrackedError(err).AbortWithServerError(c)
+		NewTrackedError(err).Abort(c)
 
 		return
 	}
@@ -45,7 +46,7 @@ func postCreateServer(c *gin.Context) {
 			return
 		}
 
-		TrackedError(err).AbortWithServerError(c)
+		NewTrackedError(err).Abort(c)
 		return
 	}
 
@@ -99,7 +100,7 @@ func postUpdateConfiguration(c *gin.Context) {
 		// before this code was run.
 		config.Set(&ccopy)
 
-		TrackedError(err).AbortWithServerError(c)
+		NewTrackedError(err).Abort(c)
 		return
 	}
 

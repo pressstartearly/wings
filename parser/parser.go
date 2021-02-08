@@ -3,20 +3,21 @@ package parser
 import (
 	"bufio"
 	"encoding/json"
-	"github.com/apex/log"
-	"github.com/beevik/etree"
-	"github.com/buger/jsonparser"
-	"github.com/icza/dyno"
-	"github.com/magiconair/properties"
-	"github.com/pkg/errors"
-	"github.com/pterodactyl/wings/config"
-	"gopkg.in/ini.v1"
-	"gopkg.in/yaml.v2"
 	"io/ioutil"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
+
+	"emperror.dev/errors"
+	"github.com/apex/log"
+	"github.com/beevik/etree"
+	"github.com/buger/jsonparser"
+	"github.com/icza/dyno"
+	"github.com/magiconair/properties"
+	"github.com/pterodactyl/wings/config"
+	"gopkg.in/ini.v1"
+	"gopkg.in/yaml.v2"
 )
 
 // The file parsing options that are available for a server configuration file.
@@ -219,7 +220,7 @@ func (f *ConfigurationFile) parseXmlFile(path string) error {
 			parts := strings.Split(replacement.Match, ".")
 
 			// Set the initial element to be the root element, and then work from there.
-			var element = doc.Root()
+			element := doc.Root()
 
 			// Iterate over the path to create the required structure for the given element's path.
 			// This does not set a value, only ensures that the base structure exists. We start at index

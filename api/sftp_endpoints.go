@@ -1,9 +1,10 @@
 package api
 
 import (
-	"github.com/apex/log"
-	"github.com/pkg/errors"
 	"regexp"
+
+	"emperror.dev/errors"
+	"github.com/apex/log"
 )
 
 type SftpAuthRequest struct {

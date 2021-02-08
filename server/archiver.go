@@ -3,14 +3,15 @@ package server
 import (
 	"crypto/sha256"
 	"encoding/hex"
-	"github.com/mholt/archiver/v3"
-	"github.com/pkg/errors"
-	"github.com/pterodactyl/wings/config"
-	"github.com/pterodactyl/wings/server/filesystem"
 	"io"
 	"io/ioutil"
 	"os"
 	"path/filepath"
+
+	"emperror.dev/errors"
+	"github.com/mholt/archiver/v3"
+	"github.com/pterodactyl/wings/config"
+	"github.com/pterodactyl/wings/server/filesystem"
 )
 
 // Archiver represents a Server Archiver.

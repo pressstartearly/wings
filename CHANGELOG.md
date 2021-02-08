@@ -1,5 +1,48 @@
 # Changelog
 
+## v1.2.3
+### Fixed
+* **[Security]** Fixes a remaining security vulnerability in the code handling remote file downloads for servers relating to redirect validation.
+
+### Added
+* Adds a configuration key at `api.disable_remote_download` that can be set to `true` to completely download the remote download system.
+
+## v1.2.2
+### Fixed
+* Reverts changes to logic handling blocking until a server process is done running when polling stats. This change exposed a bug in the underlying Docker system causing servers to enter a state in which Wings was unable to terminate the process and Docker commands would hang if executed against the container.
+
+### Changed
+* Adds logic to handle a console stream unexpectedly returning an EOF when reading console logs. New code should automatically re-attach the stream avoiding issues where the console would stop live updating for servers.
+
+## v1.2.1
+### Fixed
+* Fixes servers not be properly marked as no longer transfering if an error occurs during the archive process.
+* Fixes problems with user detection when running Wings inside a Docker container.
+* Fixes filename decoding issues with multiple endpoints related to the file manager (namely move/copy/delete).
+* **[Security]** Fixes vulnerability allowing a malicious user to abuse the remote file download utilitity to scan or access resources on the local network.
+* Fixes network `tx` stats not correctly being reported (was previously reporting `rx` for both `rx` and `tx`).
+
+### Changed
+* Cleans up the logic related to polling resources for the server to make a little more sense and not do pointless `io.Copy()` operations.
+
+## v1.2.0
+### Fixed
+* Fixes log compression being set on the Docker containers being created to avoid errors on some versions of Docker.
+* Cleaned up logic handling server resource usage to avoid race conditions in the future and make the logic simpler.
+* Fixes directories being created when writing a file before checking if there was space for the file to even be written to the disk.
+* Significant performance and resource usage fixes to backups and server transfers to avoid obliterating machine `i/o` and causing excessive resource exhaustion on busy systems or low end machines.
+* Fixes server install process to not unintentionally exit and cause invalid states if a line during the install process was too long.
+* Fixes symlink error handling in backups to not unexpectedly tank a request. Any errors due to a symlink are now ignored and will not impact the generation of a backup (including for server transfers).
+
+### Changed
+* Changed `--debug` flag to no longer ignore certificate errors on requests. Use `--ignore-certificate-errors` to ignore any certificate errors encountered when in development environments.
+* Changed all Filesystem related errors to be of the same internal error type making error checking significantly easier and less error prone.
+* Improves log output stacktraces to be more accurate as to the source of the issue.
+
+### Added
+* Adds support for downloading files to a server's data directory and optionally checking the status of or canceling in-progress downloads.
+* Adds a `context.Context` to `server.Server` structs allowing for cancelation of long running background tasks when a server is deleted without additional complexity on developer's end.
+
 ## v1.1.3
 ### Fixed
 * Fixes `archive/tar: write too long` error when creating a server backup.

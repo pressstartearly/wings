@@ -2,11 +2,6 @@ package config
 
 import (
 	"fmt"
-	"github.com/cobaugh/osrelease"
-	"github.com/creasty/defaults"
-	"github.com/gbrlsnchs/jwt/v3"
-	"github.com/pkg/errors"
-	"gopkg.in/yaml.v2"
 	"io/ioutil"
 	"os"
 	"os/exec"
@@ -14,6 +9,12 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+
+	"emperror.dev/errors"
+	"github.com/cobaugh/osrelease"
+	"github.com/creasty/defaults"
+	"github.com/gbrlsnchs/jwt/v3"
+	"gopkg.in/yaml.v2"
 )
 
 const DefaultLocation = "/etc/pterodactyl/config.yml"
@@ -87,10 +88,15 @@ type ApiConfiguration struct {
 
 	// SSL configuration for the daemon.
 	Ssl struct {
-		Enabled         bool   `default:"false"`
+		Enabled         bool   `json:"enabled" yaml:"enabled"`
 		CertificateFile string `json:"cert" yaml:"cert"`
 		KeyFile         string `json:"key" yaml:"key"`
 	}
+
+	// Determines if functionality for allowing remote download of files into server directories
+	// is enabled on this instance. If set to "true" remote downloads will not be possible for
+	// servers.
+	DisableRemoteDownload bool `json:"disable_remote_download" yaml:"disable_remote_download"`
 
 	// The maximum size for files uploaded through the Panel in bytes.
 	UploadLimit int `default:"100" json:"upload_limit" yaml:"upload_limit"`
@@ -223,6 +229,36 @@ func (c *Configuration) GetPath() string {
 // If files are not owned by this user there will be issues with permissions on Docker
 // mount points.
 func (c *Configuration) EnsurePterodactylUser() (*user.User, error) {
+	sysName, err := getSystemName()
+	if err != nil {
+		return nil, err
+	}
+
+	// Our way of detecting if wings is running inside of Docker.
+	if sysName == "busybox" {
+		uid := os.Getenv("WINGS_UID")
+		if uid == "" {
+			uid = "988"
+		}
+
+		gid := os.Getenv("WINGS_GID")
+		if gid == "" {
+			gid = "988"
+		}
+
+		username := os.Getenv("WINGS_USERNAME")
+		if username == "" {
+			username = "pterodactyl"
+		}
+
+		u := &user.User{
+			Uid:      uid,
+			Gid:      gid,
+			Username: username,
+		}
+		return u, c.setSystemUser(u)
+	}
+
 	u, err := user.Lookup(c.System.Username)
 
 	// If an error is returned but it isn't the unknown user error just abort
@@ -233,17 +269,12 @@ func (c *Configuration) EnsurePterodactylUser() (*user.User, error) {
 		return nil, err
 	}
 
-	sysName, err := getSystemName()
-	if err != nil {
-		return nil, err
-	}
-
-	var command = fmt.Sprintf("useradd --system --no-create-home --shell /bin/false %s", c.System.Username)
+	command := fmt.Sprintf("useradd --system --no-create-home --shell /usr/sbin/nologin %s", c.System.Username)
 
 	// Alpine Linux is the only OS we currently support that doesn't work with the useradd command, so
 	// in those cases we just modify the command a bit to work as expected.
 	if strings.HasPrefix(sysName, "alpine") {
-		command = fmt.Sprintf("adduser -S -D -H -G %[1]s -s /bin/false %[1]s", c.System.Username)
+		command = fmt.Sprintf("adduser -S -D -H -G %[1]s -s /sbin/nologin %[1]s", c.System.Username)
 
 		// We have to create the group first on Alpine, so do that here before continuing on
 		// to the user creation process.
@@ -267,8 +298,15 @@ func (c *Configuration) EnsurePterodactylUser() (*user.User, error) {
 // Set the system user into the configuration and then write it to the disk so that
 // it is persisted on boot.
 func (c *Configuration) setSystemUser(u *user.User) error {
-	uid, _ := strconv.Atoi(u.Uid)
-	gid, _ := strconv.Atoi(u.Gid)
+	uid, err := strconv.Atoi(u.Uid)
+	if err != nil {
+		return err
+	}
+
+	gid, err := strconv.Atoi(u.Gid)
+	if err != nil {
+		return err
+	}
 
 	c.Lock()
 	c.System.Username = u.Username
